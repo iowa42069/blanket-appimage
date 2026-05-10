@@ -1,59 +1,102 @@
-name: Build and Deploy AppImage
+name: Build AppImage with Arch Linux Docker
 
 on:
   push:
     branches:
-      - main # Or the branch you want to trigger this workflow on
+      - main # Trigger on pushes to the main branch
 
 jobs:
   build_and_push_appimage:
+    # This specifies the host runner OS, but the 'container' block below defines the actual execution environment.
     runs-on: ubuntu-latest
 
+    # Define the Docker container environment for this job
+    container:
+      # Use the official Arch Linux image. Consider pinning to a specific version for stability, e.g., 'archlinux:2023.10.01'
+      image: archlinux:latest
+      # options: --privileged # <<< Uncomment this ONLY if bwrap STILL fails without it. It's a security risk.
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      # Step 1: Checkout the repository code
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch the entire history to ensure `git push` works correctly
+          fetch-depth: 0
 
-      - name: Install wget
-        run: sudo apt-get update && sudo apt-get install -y wget
+      # Step 2: Set up the Arch Linux environment inside the container
+      # All commands here will execute *inside* the Arch Linux Docker container.
+      - name: Set up Arch Linux environment
+        run: |
+          # Update package lists and install necessary tools using pacman
+          # '--noconfirm' automatically confirms prompts
+          pacman -Syu --noconfirm wget base-devel git bubblewrap
 
-      - name: Download blanket-anylinux.sh
-        run: wget https://github.com/iowa42069/blanket-appimage/raw/refs/heads/main/blanket-anylinux.sh -O blanket-anylinux.sh
+          # Add any other dependencies your build script requires here
+          # For example: pacman -S --noconfirm some-other-dependency
 
-      - name: Make blanket-anylinux.sh executable
+      # Step 3: Download the build script into the container
+      - name: Download build script
+        run: wget https://github.com/iowa42069/blanket-appimage/raw/refs/heads/main/blanket-anylinux.sh
+
+      # Step 4: Make the build script executable
+      - name: Make script executable
         run: chmod +x blanket-anylinux.sh
 
-      - name: Run build script
-        run: bash blanket-anylinux.sh
+      # Step 5: Execute the build script within the container
+      # The bwrap command should now work because it's running inside a container
+      # where user namespace isolation might be handled differently or less restrictively.
+      - name: Execute build script
+        run: ./blanket-anylinux.sh
 
-      - name: Find the AppImage
-        # IMPORTANT: You still need to customize this step to find your AppImage.
-        # The script will create an AppImage, but you need to tell the workflow
-        # how to locate it.
-        #
-        # Example: If your script always outputs the AppImage to 'dist/my-app.AppImage'
-        # run: echo "APPIMAGE_FOUND=true" >> $GITHUB_ENV && echo "APPIMAGE_NAME=dist/my-app.AppImage" >> $GITHUB_ENV
-        #
-        # Example: If you need to find it by pattern (e.g., ends with .AppImage)
+      # Step 6: Find the generated AppImage file
+      - name: Find the generated AppImage
+        id: find_appimage
         run: |
-          APPIMAGE_FILE=$(find . -name "*.AppImage" -print -quit)
-          if [ -n "$APPIMAGE_FILE" ]; then
-            echo "APPIMAGE_FOUND=true" >> $GITHUB_ENV
-            echo "APPIMAGE_NAME=$APPIMAGE_FILE" >> $GITHUB_ENV
-            echo "Found AppImage: $APPIMAGE_FILE"
+          echo "Searching for the AppImage file..."
+          # !!! IMPORTANT !!!
+          # You MUST adjust the pattern below to correctly match your AppImage's filename.
+          # Example: If your AppImage is named 'my-awesome-app-x86_64.AppImage', use that.
+          # A common pattern might be '*-x86_64.AppImage' or similar.
+          # The current pattern `*.AppImage` looks for any file ending in .AppImage.
+          APPIMAGE_PATH=$(find . -name "*.AppImage" -print -quit) # <<< ADJUST THIS PATTERN IF NEEDED
+
+          if [ -n "$APPIMAGE_PATH" ]; then
+            echo "AppImage found: $APPIMAGE_PATH"
+            # Set an output variable that subsequent steps can use
+            echo "appimage_path=$APPIMAGE_PATH" >> $GITHUB_OUTPUT
           else
-            echo "Error: AppImage not found after running the script."
+            echo "Error: AppImage file not found. Please check the build script output and the find pattern."
             exit 1
           fi
 
-      - name: Commit and push AppImage
-        if: env.APPIMAGE_FOUND == 'true'
+      # Step 7: Commit and Push the AppImage back to the repository
+      # This step only runs if the AppImage was successfully found in the previous step.
+      - name: Commit and Push AppImage
+        if: steps.find_appimage.outputs.appimage_path != ''
         run: |
-          git config --global user.name 'GitHub Actions'
-          git config --global user.email 'actions@github.com'
-          git add ${{ env.APPIMAGE_NAME }}
+          # Extract the base filename of the AppImage
+          APPIMAGE_FILE=$(basename "${{ steps.find_appimage.outputs.appimage_path }}")
+          echo "Committing '$APPIMAGE_FILE' to the repository..."
+
+          # Configure Git user for the commit. Using a bot identity is common practice.
+          git config --global user.name 'GitHub Actions Bot'
+          git config --global user.email 'actions-bot@github.com'
+
+          # Add the found AppImage file to the staging area
+          git add "${{ steps.find_appimage.outputs.appimage_path }}"
+
+          # Check if there are any staged changes to commit. This prevents commits if the file hasn't changed.
           if git diff --staged --quiet; then
-            echo "No changes to commit."
+            echo "No new changes detected for the AppImage. Skipping commit."
           else
-            git commit -m "Update AppImage"
-            git push
+            # Commit the AppImage file.
+            # The '[skip ci]' in the commit message is CRUCIAL to prevent an infinite loop,
+            # as this commit would otherwise trigger the workflow again.
+            git commit -m "build: Update AppImage ([skip ci])"
+
+            # Push the commit to the branch that triggered the workflow.
+            # github.ref_name refers to the branch name (e.g., 'main').
+            git push origin HEAD:${{ github.ref_name }}
+            echo "AppImage committed and pushed successfully."
           fi
